@@ -1,0 +1,20 @@
+services:
+  api:
+    build: .
+    image: swiss-tournament-api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # 数据持久化在挂载卷中的 SQLite 文件；
+      # 也可换成本机文件路径，如 sqlite:////data/swiss.db
+      DATABASE_URL: sqlite:////data/swiss.db
+    volumes:
+      - swiss-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  swiss-data:
