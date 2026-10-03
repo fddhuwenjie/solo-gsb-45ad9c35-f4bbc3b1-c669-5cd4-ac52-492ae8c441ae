@@ -20,7 +20,10 @@ from ..schemas import (
     StandingResponse,
     TournamentCreate,
     TournamentResponse,
+    TournamentStatusControlRequest,
+    TournamentStatusResponse,
 )
+from ..services.lifecycle import apply_tournament_status, ensure_tournament_writable
 from ..services.scoring import compute_records, half_to_float
 
 router = APIRouter()
@@ -85,6 +88,34 @@ def get_tournament(tournament_id: int, db: Session = Depends(get_db)):
     return get_tournament_or_404(db, tournament_id)
 
 
+@router.post(
+    "/tournaments/{tournament_id}/status",
+    response_model=TournamentStatusResponse,
+)
+def control_tournament_status(
+    tournament_id: int,
+    payload: TournamentStatusControlRequest,
+    db: Session = Depends(get_db),
+):
+    """切换赛事状态（pause/resume/archive，幂等 + 序号快照）。
+
+    active 与 paused 可互相切换；archive 只能从 paused 且所有轮次
+    已结束、无待处理复核时进入，归档后永久只读。pause 在同一事务
+    冻结所有运行中的轮次时钟，resume 只恢复被赛事暂停的时钟。
+    """
+    tournament = get_tournament_or_404(db, tournament_id)
+    # 写请求进程级串行：重放判定、状态机校验、时钟冻结/恢复、事件
+    # 序号与「提交→发布」全程持锁
+    with writer_lock():
+        db.expire_all()
+        tournament = get_tournament_or_404(db, tournament_id)
+        response, event = apply_tournament_status(db, tournament, payload)
+        # 幂等重放（event 为 None）没有任何写入，直接返回首次结果
+        if event is not None:
+            commit_and_publish(db, [event])
+        return response
+
+
 # ---------- Participant ----------
 
 def _ensure_registration_open(db: Session, tournament_id: int) -> None:
@@ -114,6 +145,7 @@ def _add_participants(
     # 写请求进程级串行：count 读 → 编号分配 → 事件序号 → 提交发布
     # 全程持锁，并发报名既不会撞编号唯一约束，也不会交错序号。
     with writer_lock():
+        ensure_tournament_writable(db, tournament_id)
         _ensure_registration_open(db, tournament_id)
         count = (
             db.query(Participant)
@@ -210,6 +242,7 @@ def update_participant_tags(
     """登记/更新参赛者的必需标签（首轮生成后仍可调整）。"""
     get_tournament_or_404(db, tournament_id)
     with writer_lock():
+        ensure_tournament_writable(db, tournament_id)
         participant = (
             db.query(Participant)
             .filter(

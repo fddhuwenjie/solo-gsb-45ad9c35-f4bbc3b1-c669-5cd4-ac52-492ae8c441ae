@@ -44,6 +44,8 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     _migrate_participants_required_tags()
+    _migrate_tournament_status()
+    _migrate_round_clock_tournament_paused()
     # 为升级前已存在的赛事补齐计数器（新库此时无赛事，为空操作）。
     # 之后序号一律经 EventCounter 的原子 UPSERT 分配。
     with SessionLocal() as db:
@@ -73,6 +75,20 @@ def init_db() -> None:
             db.commit()
 
 
+def _add_column_if_missing(table: str, column: str, ddl: str) -> None:
+    """老库幂等补列（新库列已存在，为空操作）。"""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if table not in inspector.get_table_names():
+        return
+    columns = {c["name"] for c in inspector.get_columns(table)}
+    if column in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+
+
 def _migrate_participants_required_tags() -> None:
     """为升级前已存在的 participants 表补 required_tags 列。
 
@@ -80,19 +96,36 @@ def _migrate_participants_required_tags() -> None:
     required_tags（必需标签）列，这里对老库做幂等的
     ALTER TABLE 补列（新库列已存在，为空操作）。
     """
-    from sqlalchemy import inspect, text
-
-    inspector = inspect(engine)
-    if "participants" not in inspector.get_table_names():
-        return
-    columns = {c["name"] for c in inspector.get_columns("participants")}
-    if "required_tags" in columns:
-        return
     default = "'[]'::json" if engine.dialect.name == "postgresql" else "'[]'"
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "ALTER TABLE participants ADD COLUMN required_tags JSON "
-                f"NOT NULL DEFAULT {default}"
-            )
-        )
+    _add_column_if_missing(
+        "participants",
+        "required_tags",
+        f"required_tags JSON NOT NULL DEFAULT {default}",
+    )
+
+
+def _migrate_tournament_status() -> None:
+    """为升级前已存在的 tournaments 表补 status 列。
+
+    既有赛事统一视为 active（维护态由运营方显式切换进入）。
+    """
+    default = "'active'" if engine.dialect.name != "postgresql" else "'active'"
+    _add_column_if_missing(
+        "tournaments",
+        "status",
+        f"status VARCHAR(16) NOT NULL DEFAULT {default}",
+    )
+
+
+def _migrate_round_clock_tournament_paused() -> None:
+    """为升级前已存在的 round_clocks 表补 tournament_paused 列。
+
+    老库中 paused 的时钟均为手动暂停，默认 False：赛事 pause 不
+    触碰它们，赛事 resume 也不会错误恢复。
+    """
+    default = "0" if engine.dialect.name != "postgresql" else "false"
+    _add_column_if_missing(
+        "round_clocks",
+        "tournament_paused",
+        f"tournament_paused BOOLEAN NOT NULL DEFAULT {default}",
+    )

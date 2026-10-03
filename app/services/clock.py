@@ -126,9 +126,77 @@ def freeze_clock_for_closed_round(db: Session, round_id: int) -> None:
             now - clock.paused_at
         ).total_seconds()
         clock.paused_at = None
+    clock.tournament_paused = False
     clock.status = "ended"
     clock.ended_at = now
     db.flush()
+
+
+def freeze_running_clocks_for_tournament(
+    db: Session, tournament_id: int, now: datetime
+) -> list[int]:
+    """赛事进入维护态：冻结该赛事所有正在运行（running）的轮次时钟。
+
+    只冻结 running 的时钟：手动暂停（paused 且 tournament_paused=False）
+    的时钟本来就停走，维护期间与恢复后都保持手动暂停；已经封盘
+    （ended）与未启动（无行）的时钟不受影响。返回被冻结的轮次号
+    （升序）。冻结不推进时钟版本（不产生 round_clock.* 命令事件），
+    维护时长经 paused_at 锚点在恢复时补入累计暂停，剩余时间不会因
+    维护流逝。
+    """
+    rows = (
+        db.query(RoundClock, Round)
+        .join(Round, Round.id == RoundClock.round_id)
+        .filter(
+            Round.tournament_id == tournament_id,
+            RoundClock.status == "running",
+        )
+        .order_by(Round.round_no)
+        .all()
+    )
+    frozen_rounds: list[int] = []
+    for clock, round_obj in rows:
+        clock.status = "paused"
+        clock.paused_at = now
+        clock.tournament_paused = True
+        frozen_rounds.append(round_obj.round_no)
+    if rows:
+        db.flush()
+    return frozen_rounds
+
+
+def resume_tournament_paused_clocks(
+    db: Session, tournament_id: int, now: datetime
+) -> list[int]:
+    """赛事结束维护：只恢复被赛事暂停（tournament_paused=True）的时钟。
+
+    手动暂停（tournament_paused=False）的时钟保持暂停，其
+    paused_at 锚点未被维护触碰，维护时长不会计入该时钟的累计暂停。
+    返回恢复的轮次号（升序）。
+    """
+    rows = (
+        db.query(RoundClock, Round)
+        .join(Round, Round.id == RoundClock.round_id)
+        .filter(
+            Round.tournament_id == tournament_id,
+            RoundClock.status == "paused",
+            RoundClock.tournament_paused.is_(True),
+        )
+        .order_by(Round.round_no)
+        .all()
+    )
+    resumed_rounds: list[int] = []
+    for clock, round_obj in rows:
+        clock.accumulated_pause_seconds += (
+            now - clock.paused_at
+        ).total_seconds()
+        clock.paused_at = None
+        clock.tournament_paused = False
+        clock.status = "running"
+        resumed_rounds.append(round_obj.round_no)
+    if rows:
+        db.flush()
+    return resumed_rounds
 
 
 def serialize_clock(
@@ -189,6 +257,7 @@ def serialize_clock(
         paused_at=clock.paused_at,
         ended_at=clock.ended_at,
         accumulated_pause_seconds=clock.accumulated_pause_seconds,
+        tournament_paused=bool(clock.tournament_paused),
         server_time=now,
         matches=match_responses,
     )
@@ -249,6 +318,13 @@ def apply_clock_action(
         replay = _find_replay(db, clock, req)
         if replay is not None:
             return replay, None
+
+    # 维护/归档期间计时命令不允许产生新写入（已成功命令的重放
+    # 已在上方返回首次结果）；paused 下的手动 resume 也在此拦截，
+    # 运行中时钟在 pause 时已被赛事冻结
+    from .lifecycle import ensure_tournament_writable
+
+    ensure_tournament_writable(db, tournament_id)
 
     if round_obj.status != "open":
         raise HTTPException(
@@ -319,6 +395,7 @@ def _apply_start(
         started_at=now,
         accumulated_pause_seconds=0.0,
         paused_at=None,
+        tournament_paused=False,
         ended_at=None,
         match_extensions={},
     )
@@ -342,6 +419,8 @@ def _apply_pause(
         )
     clock.paused_at = now
     clock.status = "paused"
+    # 手动暂停：不是赛事维护冻结
+    clock.tournament_paused = False
     return clock, ROUND_CLOCK_PAUSED, {
         "round_id": round_obj.id,
         "round_no": round_obj.round_no,
@@ -356,6 +435,12 @@ def _apply_resume(
     if clock.status != "paused":
         raise HTTPException(
             status_code=409, detail="计时未处于暂停状态，不能恢复"
+        )
+    if clock.tournament_paused:
+        raise HTTPException(
+            status_code=409,
+            detail="该时钟由赛事维护冻结，只能随赛事 resume 恢复，"
+            "不接受手动 resume",
         )
     clock.accumulated_pause_seconds += (now - clock.paused_at).total_seconds()
     clock.paused_at = None
@@ -377,6 +462,10 @@ def _apply_extend(
     if clock.status not in ("running", "paused"):
         raise HTTPException(
             status_code=409, detail="计时已结束，不能加时"
+        )
+    if clock.tournament_paused:
+        raise HTTPException(
+            status_code=409, detail="赛事维护期间不能加时"
         )
     match = db.get(Match, req.match_id)
     if match is None or match.round_id != round_obj.id:

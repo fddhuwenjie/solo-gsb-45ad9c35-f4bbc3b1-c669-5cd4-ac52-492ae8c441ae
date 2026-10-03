@@ -268,6 +268,11 @@ def publish_promotion_list(
     if replay is not None:
         return PromotionListResponse(**replay.response), None
 
+    # 维护/归档期间拒绝新的名单发布（重放已在上方返回首次结果）
+    from .lifecycle import ensure_tournament_writable
+
+    ensure_tournament_writable(db, tournament_id)
+
     # 写锁可能经过等待才取得：以锁内已提交的最新状态重新校验
     _ensure_publishable(db, tournament_id)
     qualifying = (
@@ -424,6 +429,11 @@ def forfeit_promotion_seat(
     participant = db.get(Participant, req.participant_id)
     if participant is None or participant.tournament_id != tournament_id:
         raise HTTPException(status_code=404, detail="参赛者不存在")
+
+    # 维护/归档期间拒绝放弃/递补写入（重放已在上方返回首次结果）
+    from .lifecycle import ensure_tournament_writable
+
+    ensure_tournament_writable(db, tournament_id)
 
     # 只有当前有效晋级者（某席位的当前持有者）可以标记放弃
     seat = (

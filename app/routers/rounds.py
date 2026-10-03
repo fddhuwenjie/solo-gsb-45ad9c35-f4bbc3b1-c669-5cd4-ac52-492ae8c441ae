@@ -16,6 +16,7 @@ from ..services.clock import (
     get_clock,
     result_deadline_exceeded,
 )
+from ..services.lifecycle import ensure_tournament_writable
 from ..services.result_reviews import pending_review_for_match
 from ..services.rounds import generate_next_round
 from .tournaments import get_tournament_or_404, serialize_round
@@ -37,6 +38,7 @@ def next_round(tournament_id: int, db: Session = Depends(get_db)):
     # 写请求进程级串行：open 轮检查、round_no 分配、事件序号与
     # 「提交→发布」全程持锁
     with writer_lock():
+        ensure_tournament_writable(db, tournament_id)
         round_obj, events = generate_next_round(db, tournament_id)
         commit_and_publish(db, events)
         db.refresh(round_obj)
@@ -122,6 +124,7 @@ def submit_result(
         db.expire_all()
         match = db.get(Match, match_id)
         round_obj = db.get(Round, match.round_id)
+        ensure_tournament_writable(db, round_obj.tournament_id)
         if round_obj.status != "open":
             raise HTTPException(status_code=409, detail="该轮次已结束，不能修改赛果")
 

@@ -67,6 +67,16 @@
   把**最前候补**提升为该席位（无候补则保持空席），重复 `request_id`
   返回首次结果。提供赛事/版本查询，每席位含原始与当前参赛者、状态
   与冻结依据，发布与递补均写入事件流。
+- **赛事级维护态（pause / resume / archive）**：赛事初始为 `active`，
+  运营方携带 `request_id` 与 `expected_event_seq` 将整场赛事切换为
+  `pause`（维护暂停）、`resume`（恢复）或 `archive`（归档，终态）。
+  每次切换与 `tournament.*` 事件**同事务提交**，重复 `request_id`
+  返回首次结果。`pause` 在同一事务**冻结所有正在运行的轮次时钟**；
+  维护期间参赛者、轮次、赛果、签到、工位、计时、公告、复核、扣分、
+  晋级等一切写操作统一 `409` **且不留痕**，查询与事件续传仍可用；
+  `resume` **只恢复被赛事暂停的时钟**（手动暂停的时钟保持暂停），
+  **剩余时间不会因维护流逝**。`archive` 只能从 `paused` 且**所有
+  轮次已结束、无待处理复核**时进入，归档后**永久只读**。
 
 配对在 Edmonds 带花树（Blossom）最小权完美匹配算法上实现
 （`networkx.min_weight_matching`，O(n³)），同代价方案用可加的
@@ -1075,13 +1085,164 @@ curl http://localhost:8000/tournaments/1/promotions
 curl http://localhost:8000/tournaments/1/promotions/1
 ```
 
+curl http://localhost:8000/tournaments/1/promotions/1
+```
+
+### 16. 赛事维护态：暂停、恢复与归档
+
+现场突发情况（设备故障、场地清场、争议处置）可把整场赛事切换到
+维护态。赛事状态有三种：
+
+| 状态 | 含义 | 业务写操作 | 查询 / 事件续传 |
+| --- | --- | --- | --- |
+| `active` | 正常运营（赛事初始状态） | 允许 | 允许 |
+| `paused` | 维护暂停：运行中的轮次时钟已在同一事务冻结，剩余时间停走 | 一律 `409` 且不留痕 | 允许 |
+| `archived` | 归档终态：永久只读 | 一律 `409` 且不留痕 | 允许 |
+
+合法转换只有三条：`active -> paused`（pause）、
+`paused -> active`（resume）、`paused -> archived`（archive）。
+`archive` 还要求**所有已生成轮次均已结束且不存在待处理赛果复核**；
+归档后无法再恢复。
+
+切换请求携带幂等键 `request_id` 与乐观快照 `expected_event_seq`：
+每次成功切换在同一事务内冻结/恢复时钟并写入一条
+`tournament.paused` / `tournament.resumed` / `tournament.archived`
+事件（占用连续事件序号）；重复 `request_id` 原样返回首次结果，
+非法转换、快照冲突、归档前置不满足均返回 `409` 且不落任何记录。
+
+```bash
+# 先读取当前事件序号（GET 事件分页的最后一条 seq）
+curl http://localhost:8000/tournaments/1/events?limit=200
+# ... last_seq 假设为 18
+
+# 进入维护态：同一事务冻结所有正在运行的轮次时钟；
+# frozen_rounds 返回被冻结的轮次号（手动暂停/已封盘的时钟不在其中）
+curl -X POST http://localhost:8000/tournaments/1/status \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"maint-20261003-01","expected_event_seq":18,"action":"pause"}'
+# 200
+# {"id":1,"name":"...","status":"paused","expected_event_seq":18,
+#  "current_event_seq":19,"frozen_rounds":[3],"resumed_rounds":[]}
+
+# 维护期间查询时钟：状态 paused、tournament_paused=true，
+# 剩余时间冻结在暂停时刻，维护多久都不流逝
+curl http://localhost:8000/tournaments/1/rounds/3/clock
+
+# 恢复：只恢复被赛事暂停的时钟（手动暂停的保持暂停）；
+# resumed_rounds 返回恢复的轮次号
+curl -X POST http://localhost:8000/tournaments/1/status \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"maint-20261003-02","expected_event_seq":19,"action":"resume"}'
+# 200
+# {"id":1,"name":"...","status":"active","expected_event_seq":19,
+#  "current_event_seq":20,"frozen_rounds":[],"resumed_rounds":[3]}
+
+# 网络重试：同一 request_id 原样返回首次结果（不重复冻结/恢复、
+# 不产生新事件），即使维护已结束也返回首次的 paused 响应
+curl -X POST http://localhost:8000/tournaments/1/status \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"maint-20261003-01","expected_event_seq":18,"action":"pause"}'
+```
+
+维护期间被拒的写请求示例（全部 `409`、不写库、不占事件序号；
+查询与 `GET /events`、SSE 续传照常工作）：
+
+```bash
+# 先进入维护态（同上）
+curl -X POST http://localhost:8000/tournaments/1/status \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"maint-20261003-01","expected_event_seq":18,"action":"pause"}'
+
+# 录入赛果
+curl -X PUT http://localhost:8000/matches/42/result \
+  -H 'Content-Type: application/json' \
+  -d '{"score_white":1,"score_black":0}'
+# 409 {"detail":"赛事处于维护暂停状态，写操作暂不可用；查询与事件续传不受影响，可等待运营方恢复后重试"}
+
+# 生成轮次 / 参赛者 / 工位 / 签到 / 工位方案
+curl -X POST http://localhost:8000/tournaments/1/rounds/next            # 409
+curl -X POST http://localhost:8000/tournaments/1/participants \
+  -H 'Content-Type: application/json' -d '{"name":"张三"}'             # 409
+curl -X POST http://localhost:8000/tournaments/1/stations \
+  -H 'Content-Type: application/json' -d '{"station_no":7}'            # 409
+curl -X POST http://localhost:8000/tournaments/1/rounds/3/station-plans \
+  -H 'Content-Type: application/json' -d '{"expected_version":0,"pins":[]}'  # 409
+
+# 计时命令（被赛事冻结的时钟不能手动 resume / extend / pause）
+curl -X POST http://localhost:8000/tournaments/1/rounds/3/clock/actions \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"c1","expected_version":1,"action":"resume"}'
+# 409 {"detail":"赛事处于维护暂停状态，写操作暂不可用；..."}
+
+# 公告发布/修订/回执、赛果复核创建与决定、扣分登记/撤销、晋级发布/放弃
+curl -X POST http://localhost:8000/tournaments/1/penalties \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"p1","expected_event_seq":19,"participant_id":2,"points":0.5,"reason":"迟到"}'
+# 409 {"detail":"赛事处于维护暂停状态，写操作暂不可用；..."}
+
+# 例外：维护前已成功的幂等写请求，用同一 request_id 重放仍返回首次结果，
+# 不被维护拦截（各业务模块的幂等语义在状态保护之前判定）
+
+# 读操作与事件续传不受影响
+curl http://localhost:8000/tournaments/1                                    # 200
+curl http://localhost:8000/tournaments/1/standings                          # 200
+curl 'http://localhost:8000/tournaments/1/events?after=18'                  # 200
+curl -N 'http://localhost:8000/tournaments/1/events/stream?after=18'        # SSE 正常推送
+```
+
+非法状态切换与归档前置校验示例：
+
+```bash
+# active 下直接 resume / archive
+curl -X POST http://localhost:8000/tournaments/1/status \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"x1","expected_event_seq":18,"action":"resume"}'
+# 409 {"detail":"赛事当前为 active 状态，不能执行 resume"}
+
+# 快照落后/超前
+curl -X POST http://localhost:8000/tournaments/1/status \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"x2","expected_event_seq":99,"action":"pause"}'
+# 409 {"detail":"赛事快照已变化：当前最大事件序号为 18，请求期望 99"}
+
+# 同键不同参数
+curl -X POST http://localhost:8000/tournaments/1/status \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"maint-20261003-01","expected_event_seq":19,"action":"pause"}'
+# 409 {"detail":"request_id 已被用于该赛事的其他状态切换请求，请更换 request_id"}
+
+# 归档：必须先 pause，且全部轮次结束、无待处理复核
+curl -X POST http://localhost:8000/tournaments/1/status \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"fin-01","expected_event_seq":20,"action":"archive"}'
+# active 下：409 {"detail":"赛事当前为 active 状态，不能执行 archive"}
+curl -X POST http://localhost:8000/tournaments/1/status \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"maint-20261003-03","expected_event_seq":20,"action":"pause"}'
+# 第 3 轮仍 open：
+# 409 {"detail":"第 3 轮尚未结束，不能归档赛事"}
+# 有待处理复核：
+# 409 {"detail":"赛事存在待处理的赛果复核，需待复核关闭后才能归档"}
+
+# 条件满足后归档（终态）
+curl -X POST http://localhost:8000/tournaments/1/status \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"fin-02","expected_event_seq":20,"action":"archive"}'
+# 200 {"id":1,"name":"...","status":"archived", ...}
+
+# 归档后任何写操作（含 pause/resume/archive）永久 409
+curl -X POST http://localhost:8000/tournaments/1/rounds/next
+# 409 {"detail":"赛事已归档（永久只读），不能再进行写操作"}
+```
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/tournaments` | 创建赛事 |
 | GET | `/tournaments` | 赛事列表 |
-| GET | `/tournaments/{id}` | 赛事详情 |
+| GET | `/tournaments/{id}` | 赛事详情（含 `status`: active/paused/archived） |
+| POST | `/tournaments/{id}/status` | 赛事状态切换（pause/resume/archive，幂等 + 序号快照；pause 同事务冻结运行中时钟，archive 需全部轮次结束且无待处理复核） |
 | POST | `/tournaments/{id}/participants` | 录入单个参赛者（可带必需标签） |
 | POST | `/tournaments/{id}/participants/bulk` | 批量录入参赛者 |
 | GET | `/tournaments/{id}/participants` | 参赛者名单（按编号） |
@@ -1209,7 +1370,14 @@ request_id 幂等重放与冲突、撤销同事务置原扣分为已撤销、重
 仅当前有效晋级者可放弃且最前候补同事务递补、无候补保持空席、
 递补者再放弃链式递补、名单冻结后赛事继续仍可放弃、发布与递补写入
 事件流、并发放弃同一席位仅一成一败、并发同键不同参数发布仅一成
-落库），以及
+落库），赛事维护态专项（初始 active、非法转换/快照冲突/同键异参
+409 不落库不占号、request_id 幂等重放返回首次结果、pause 同事务
+冻结全部运行中时钟且不推进时钟版本、手动暂停时钟不被维护触碰、
+resume 只恢复赛事冻结时钟且维护时长不计入运行、冻结/恢复列表与
+tournament.* 事件同事务提交、维护/归档期间十类写操作统一 409
+不留痕而查询与事件续传可用、维护前成功请求的 request_id 重放仍
+返回首次结果、归档需全部轮次结束且无待处理复核且归档后永久只读、
+老库 status/tournament_paused 列幂等迁移），以及
 事件流专项测试——事务回滚不留事件、
 提交失败不广播且不留事件、原子计数器回滚不占号、并发报名/赛果/
 开轮（多线程屏障同时放行）下编号与序号唯一连续、并发提交按序号

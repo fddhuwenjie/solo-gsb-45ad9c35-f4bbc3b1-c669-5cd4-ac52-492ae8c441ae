@@ -347,6 +347,11 @@ def publish_announcement(
     if replay is not None:
         return replay, None
 
+    # 维护/归档期间拒绝新公告写入（重放已在上方返回首次结果）
+    from .lifecycle import ensure_tournament_writable
+
+    ensure_tournament_writable(db, tournament_id)
+
     # 先校验规则（无效不落库），再在同一写事务内确认快照未变化
     recipients = resolve_recipients(db, tournament_id, req.rules)
     _assert_snapshot(db, tournament_id, req.expected_event_seq)
@@ -410,6 +415,11 @@ def revise_announcement(
     replay = _find_action(db, tournament_id, req.request_id, fingerprint)
     if replay is not None:
         return replay, None
+
+    # 维护/归档期间拒绝新版本写入（重放已在上方返回首次结果）
+    from .lifecycle import ensure_tournament_writable
+
+    ensure_tournament_writable(db, tournament_id)
 
     # 规则校验与快照确认同事务完成，任一不过则不落库
     recipients = resolve_recipients(db, tournament_id, req.rules)
@@ -524,6 +534,11 @@ def acknowledge(
             ),
             None,
         )
+
+    # 维护/归档期间拒绝新的回执写入；重复回执已在上方原样返回
+    from .lifecycle import ensure_tournament_writable
+
+    ensure_tournament_writable(db, tournament_id)
 
     ack = AnnouncementAcknowledgement(
         revision_id=revision.id, participant_id=participant_id

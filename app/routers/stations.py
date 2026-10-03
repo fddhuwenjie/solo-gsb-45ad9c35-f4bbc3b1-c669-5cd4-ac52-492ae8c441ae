@@ -24,6 +24,7 @@ from ..schemas import (
     StationAssignmentResponse,
     UnassignedMatchResponse,
 )
+from ..services.lifecycle import ensure_tournament_writable
 from ..services.station_plans import create_station_plan
 from .tournaments import get_tournament_or_404
 
@@ -52,6 +53,7 @@ def serialize_plan(plan: StationPlan) -> StationPlanResponse:
 def _add_stations(db: Session, tournament_id: int, items: list[StationCreate]):
     # 写请求进程级串行：重复检查与插入全程持锁
     with writer_lock():
+        ensure_tournament_writable(db, tournament_id)
         problems: list[str] = []
         seen: set[int] = set()
         for item in items:
@@ -142,6 +144,7 @@ def update_station(
 ):
     get_tournament_or_404(db, tournament_id)
     with writer_lock():
+        ensure_tournament_writable(db, tournament_id)
         station = (
             db.query(Station)
             .filter(
@@ -190,6 +193,7 @@ def publish_station_plan(
     # 写请求进程级串行：版本检查、固定工位校验、求解、事件序号与
     # 「提交→发布」全程持锁
     with writer_lock():
+        ensure_tournament_writable(db, tournament_id)
         plan, event = create_station_plan(
             db,
             tournament_id,

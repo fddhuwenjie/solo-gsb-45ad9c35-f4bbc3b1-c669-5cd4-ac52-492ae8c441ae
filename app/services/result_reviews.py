@@ -184,6 +184,11 @@ def create_result_review(
 
     round_obj = db.get(Round, match.round_id)
 
+    # 维护/归档期间拒绝新的复核写入（重放已在上方返回首次结果）
+    from .lifecycle import ensure_tournament_writable
+
+    ensure_tournament_writable(db, round_obj.tournament_id)
+
     if match.player_black_id is None:
         raise HTTPException(status_code=409, detail="轮空对局不能申请复核")
     if match.score_white is None or match.score_black is None:
@@ -304,6 +309,12 @@ def decide_result_review(
         raise HTTPException(
             status_code=409, detail="该参赛者不是本场对局选手，不能参与复核决定"
         )
+
+    # 维护/归档期间不允许改变复核状态（已关闭复核的重复决定在
+    # 下方原样返回，属于查询语义，不产生写入）
+    from .lifecycle import ensure_tournament_writable
+
+    ensure_tournament_writable(db, round_obj.tournament_id)
 
     decision = next(
         (d for d in review.decisions if d.participant_id == participant_id),

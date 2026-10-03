@@ -183,6 +183,11 @@ def submit_snapshot(
     if replay is not None:
         return replay, None
 
+    # 维护/归档期间拒绝新的签到写入（已成功请求的重放上方已返回）
+    from .lifecycle import ensure_tournament_writable
+
+    ensure_tournament_writable(db, tournament_id)
+
     participants = _participants_by_number(db, tournament_id)
     if not participants:
         raise HTTPException(status_code=400, detail="赛事还没有参赛者，无法签到")
@@ -280,6 +285,11 @@ def confirm_snapshot(
     )
     if replay is not None:
         return replay, None
+
+    # 维护/归档期间拒绝新的确认写入（已成功请求的重放上方已返回）
+    from .lifecycle import ensure_tournament_writable
+
+    ensure_tournament_writable(db, tournament_id)
 
     snapshot = (
         db.query(CheckInSnapshot)

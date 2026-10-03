@@ -197,6 +197,11 @@ def record_penalty(
     if participant is None:
         raise HTTPException(status_code=404, detail="参赛者不存在")
 
+    # 维护/归档期间拒绝新的扣分写入（重放已在上方返回首次结果）
+    from .lifecycle import ensure_tournament_writable
+
+    ensure_tournament_writable(db, tournament_id)
+
     _ensure_ledger_open(db, tournament_id)
     _check_event_seq_snapshot(db, tournament_id, req.expected_event_seq)
 
@@ -259,6 +264,11 @@ def revoke_penalty(
     replay = _find_replay(db, tournament_id, req.request_id, fingerprint)
     if replay is not None:
         return replay, None
+
+    # 维护/归档期间拒绝撤销写入（重放已在上方返回首次结果）
+    from .lifecycle import ensure_tournament_writable
+
+    ensure_tournament_writable(db, tournament_id)
 
     if target.kind != DEDUCT:
         raise HTTPException(

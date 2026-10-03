@@ -24,6 +24,11 @@ class Tournament(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # active（正常运营）/ paused（赛事级维护暂停：所有写操作 409，
+    # 查询与事件续传可用）/ archived（永久只读归档，终态）
+    status: Mapped[str] = mapped_column(
+        String(16), default="active", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False
     )
@@ -52,6 +57,50 @@ class Tournament(Base):
         back_populates="tournament",
         cascade="all, delete-orphan",
         order_by="CheckInSnapshot.round_no",
+    )
+    lifecycle_actions: Mapped[list["TournamentLifecycleAction"]] = relationship(
+        back_populates="tournament",
+        cascade="all, delete-orphan",
+        order_by="TournamentLifecycleAction.id",
+    )
+
+
+class TournamentLifecycleAction(Base):
+    """赛事状态切换请求的幂等记录：同一 request_id 重放原样返回。
+
+    request_id 在赛事内唯一；记录与赛事状态变更（pause 时冻结时钟、
+    resume 时恢复时钟）、tournament.* 事件在同一事务中提交。
+    非法状态转换/快照冲突/归档前置条件不满足等被拒绝的请求（409）
+    不落任何记录。
+    """
+
+    __tablename__ = "tournament_lifecycle_actions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_id", "request_id", name="uq_tournament_lifecycle_request"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    # 客户端幂等键：赛事内唯一
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # pause / resume / archive
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 请求前断言的赛事当前最大事件序号
+    expected_event_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 请求参数指纹：{"action": ..., "expected_event_seq": ...}
+    params: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # 首次执行后的响应快照：重复 request_id 原样返回
+    response: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    tournament: Mapped[Tournament] = relationship(
+        back_populates="lifecycle_actions"
     )
 
 
@@ -340,6 +389,12 @@ class RoundClock(Base):
     )
     # 暂停时刻（仅 paused 状态有值）；恢复时清空并计入累计暂停
     paused_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 当前暂停是否由赛事级维护（tournament pause）冻结：True 时只能
+    # 由 tournament resume 解除；赛事恢复前手动 pause/resume 一律 409。
+    # 手动暂停（时钟命令）时为 False，赛事 pause 不触碰手动暂停的时钟。
+    tournament_paused: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
     # 轮次封盘时刻（仅 ended 状态有值）：冻结剩余时间
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # 各非轮空对局的累计加时：{"<match_id>": seconds}

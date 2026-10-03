@@ -36,8 +36,43 @@ class TournamentCreate(BaseModel):
 class TournamentResponse(BaseModel):
     id: int
     name: str
+    # active（正常）/ paused（维护暂停）/ archived（永久只读归档）
+    status: str = "active"
 
     model_config = {"from_attributes": True}
+
+
+class TournamentStatusControlRequest(BaseModel):
+    """赛事状态切换命令：一个请求执行一次 pause/resume/archive。
+
+    携带幂等键 request_id 与乐观快照 expected_event_seq；重复
+    request_id（action 与 expected_event_seq 一致）原样返回首次
+    结果，非法转换/快照冲突返回 409 且不落库。
+    """
+
+    request_id: str = Field(
+        min_length=1, max_length=128, description="幂等键：重复提交返回首次结果"
+    )
+    expected_event_seq: int = Field(
+        ge=0,
+        description="期望的赛事当前最大事件序号；不一致返回 409 且不落库",
+    )
+    action: Literal["pause", "resume", "archive"]
+
+
+class TournamentStatusResponse(BaseModel):
+    id: int
+    name: str
+    # active / paused / archived
+    status: str
+    # 切换前赛事当前最大事件序号
+    expected_event_seq: int
+    # 本次切换后赛事当前最大事件序号（重放时等于首次结果）
+    current_event_seq: int
+    # pause：被维护冻结的运行中轮次号（升序）；resume/archive 为 []
+    frozen_rounds: list[int] = []
+    # resume：从维护冻结中恢复的轮次号（升序）；pause/archive 为 []
+    resumed_rounds: list[int] = []
 
 
 # ---------- Participant ----------
@@ -363,6 +398,9 @@ class ClockResponse(BaseModel):
     paused_at: datetime | None = None
     ended_at: datetime | None = None
     accumulated_pause_seconds: float = 0.0
+    # paused 时该暂停是否由赛事级维护冻结（True：仅 tournament resume
+    # 可恢复）；非 paused 恒为 false
+    tournament_paused: bool = False
     # 服务端当前 UTC 时间，供客户端校准倒计时
     server_time: datetime
     # 本轮各非轮空对局的计时（轮空对局不计时）
