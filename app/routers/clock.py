@@ -18,6 +18,7 @@ from ..locking import writer_lock
 from ..models import Round
 from ..schemas import ClockActionRequest, ClockResponse
 from ..services.clock import apply_clock_action, get_clock, serialize_clock
+from ..services.lifecycle import ensure_tournament_writable
 from .tournaments import get_tournament_or_404
 
 router = APIRouter()
@@ -51,6 +52,7 @@ def clock_action(
     # 写请求进程级串行：幂等判定、状态机校验、版本检查、事件序号与
     # 「提交→发布」全程持锁
     with writer_lock():
+        ensure_tournament_writable(db, tournament_id)
         round_obj = _get_round_or_404(db, tournament_id, round_no)
         response, event = apply_clock_action(
             db, tournament_id, round_obj, payload

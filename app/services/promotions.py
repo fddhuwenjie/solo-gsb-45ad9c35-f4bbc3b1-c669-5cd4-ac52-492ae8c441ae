@@ -52,6 +52,7 @@ from ..schemas import (
     PromotionWaitlistEntryResponse,
 )
 from .announcements import current_event_seq
+from .lifecycle import ensure_tournament_writable
 from .result_reviews import has_pending_review_for_tournament
 from .scoring import compute_records, half_to_float
 
@@ -257,6 +258,8 @@ def publish_promotion_list(
     幂等重放时返回（首次响应, None），不产生任何写入；资格不符、
     名额非法或事件序号快照冲突抛 409，且在任何写入之前抛出（不落库）。
     """
+    # 维护态/归档赛事拒绝一切写操作（在幂等判定与任何写入之前）
+    ensure_tournament_writable(db, tournament_id)
     fingerprint = {
         "action": PUBLISH,
         "qualifying_round_no": req.qualifying_round_no,
@@ -409,6 +412,8 @@ def forfeit_promotion_seat(
     if plist is None:
         raise HTTPException(status_code=404, detail="晋级名单不存在")
     tournament_id = plist.tournament_id
+    # 维护态/归档赛事拒绝一切写操作（在幂等判定与任何写入之前）
+    ensure_tournament_writable(db, tournament_id)
 
     fingerprint = {
         "action": FORFEIT,

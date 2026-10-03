@@ -39,6 +39,9 @@ CHECKIN_SNAPSHOT_CHANGED = "checkin.snapshot_changed"
 CHECKIN_SNAPSHOT_CONFIRMED = "checkin.snapshot_confirmed"
 PROMOTION_PUBLISHED = "promotion.published"
 PROMOTION_SUBSTITUTED = "promotion.substituted"
+TOURNAMENT_PAUSED = "tournament.paused"
+TOURNAMENT_RESUMED = "tournament.resumed"
+TOURNAMENT_ARCHIVED = "tournament.archived"
 
 
 def _allocate_next_seq(db: Session, tournament_id: int) -> int:

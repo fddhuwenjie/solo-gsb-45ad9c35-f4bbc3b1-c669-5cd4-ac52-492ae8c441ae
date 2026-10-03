@@ -17,6 +17,7 @@ from ..services.checkins import (
     serialize_snapshot,
     submit_snapshot,
 )
+from ..services.lifecycle import ensure_tournament_writable
 from .tournaments import get_tournament_or_404
 
 router = APIRouter()
@@ -33,6 +34,7 @@ def _submit(
     get_tournament_or_404(db, tournament_id)
     with writer_lock():
         db.expire_all()
+        ensure_tournament_writable(db, tournament_id)
         response, event = submit_snapshot(db, tournament_id, payload)
         # 幂等重放没有任何写入，直接返回首次结果
         if event is not None:
@@ -85,6 +87,7 @@ def _confirm(
     get_tournament_or_404(db, tournament_id)
     with writer_lock():
         db.expire_all()
+        ensure_tournament_writable(db, tournament_id)
         response, event = confirm_snapshot(db, tournament_id, payload)
         if event is not None:
             commit_and_publish(db, [event])

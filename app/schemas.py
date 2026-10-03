@@ -36,8 +36,63 @@ class TournamentCreate(BaseModel):
 class TournamentResponse(BaseModel):
     id: int
     name: str
+    # 赛事状态：active（正常）/ paused（维护态）/ archived（归档，永久只读）
+    status: str
 
     model_config = {"from_attributes": True}
+
+
+# ---------- Tournament lifecycle（状态控制） ----------
+
+class TournamentStatusActionRequest(BaseModel):
+    """赛事状态切换命令：一个请求执行一次切换。
+
+    - pause：active -> paused，进入维护态并冻结所有运行中的轮次时钟；
+    - resume：paused -> active，仅恢复被赛事暂停的时钟；
+    - archive：paused -> archived，要求所有轮次已结束且无待处理复核，
+      归档后永久只读。
+    """
+
+    request_id: str = Field(
+        min_length=1, max_length=128, description="幂等键：重复提交返回首次结果"
+    )
+    expected_event_seq: int = Field(
+        ge=0,
+        description="期望的赛事当前最大事件序号；不一致返回 409 且不落库",
+    )
+    action: Literal["pause", "resume", "archive"]
+
+
+class StatusClockBrief(BaseModel):
+    """一次状态切换中受影响（被冻结/被恢复）的轮次时钟。"""
+
+    round_id: int
+    round_no: int
+
+
+class TournamentStatusResponse(BaseModel):
+    tournament_id: int
+    # 切换后的赛事状态：active / paused / archived
+    status: str
+    # 切换前的赛事状态
+    previous_status: str
+    # 本次执行的命令：pause / resume / archive
+    action: str
+    request_id: str
+    expected_event_seq: int
+    # 本次切换写入的 tournament.* 事件序号
+    event_seq: int
+    # pause 时被赛事冻结的运行中时钟（resume/archive 时为空）
+    frozen_clocks: list[StatusClockBrief] = []
+    # resume 时被恢复的赛事暂停时钟（pause/archive 时为空）；
+    # 手动暂停的时钟不在其列
+    resumed_clocks: list[StatusClockBrief] = []
+    # 切换发生的服务端 UTC 时间（ISO 8601，Z 结尾）
+    changed_at: datetime
+
+    @field_serializer("changed_at")
+    def serialize_changed_at(self, v: datetime) -> str:
+        return _serialize_utc(v)
 
 
 # ---------- Participant ----------

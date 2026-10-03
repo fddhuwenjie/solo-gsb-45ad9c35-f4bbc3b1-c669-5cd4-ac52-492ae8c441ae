@@ -44,6 +44,7 @@ from ..schemas import (
     ResultReviewResponse,
 )
 from .announcements import current_event_seq
+from .lifecycle import ensure_tournament_writable
 from .scoring import half_to_float
 from .swiss import WIN
 
@@ -176,13 +177,15 @@ def create_result_review(
     if match is None:
         raise HTTPException(status_code=404, detail="对局不存在")
 
+    round_obj = db.get(Round, match.round_id)
+    # 维护态/归档赛事拒绝一切写操作（在幂等判定与任何写入之前）
+    ensure_tournament_writable(db, round_obj.tournament_id)
+
     fingerprint = _params_fingerprint(req)
     # 幂等判定先于业务校验：重试已成功请求必须返回原结果
     replay = _find_replay(db, match_id, req.request_id, fingerprint)
     if replay is not None:
         return replay, None
-
-    round_obj = db.get(Round, match.round_id)
 
     if match.player_black_id is None:
         raise HTTPException(status_code=409, detail="轮空对局不能申请复核")
@@ -288,6 +291,8 @@ def decide_result_review(
     review = get_review_or_404(db, review_id)
     match = db.get(Match, review.match_id)
     round_obj = db.get(Round, match.round_id)
+    # 维护态/归档赛事拒绝一切写操作（在任何写入之前）
+    ensure_tournament_writable(db, round_obj.tournament_id)
 
     player_ids = {match.player_white_id, match.player_black_id}
     participant = (

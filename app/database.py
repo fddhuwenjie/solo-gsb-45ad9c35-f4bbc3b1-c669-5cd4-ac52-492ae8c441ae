@@ -44,6 +44,7 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     _migrate_participants_required_tags()
+    _migrate_tournament_lifecycle()
     # 为升级前已存在的赛事补齐计数器（新库此时无赛事，为空操作）。
     # 之后序号一律经 EventCounter 的原子 UPSERT 分配。
     with SessionLocal() as db:
@@ -73,26 +74,50 @@ def init_db() -> None:
             db.commit()
 
 
-def _migrate_participants_required_tags() -> None:
-    """为升级前已存在的 participants 表补 required_tags 列。
-
-    create_all 只建新表、不改旧表；工位模块为参赛者新增了
-    required_tags（必需标签）列，这里对老库做幂等的
-    ALTER TABLE 补列（新库列已存在，为空操作）。
-    """
+def _add_column_if_missing(table: str, column: str, ddl: str) -> None:
+    """对已存在的表幂等地补列（create_all 只建新表、不改旧表）。"""
     from sqlalchemy import inspect, text
 
     inspector = inspect(engine)
-    if "participants" not in inspector.get_table_names():
+    if table not in inspector.get_table_names():
         return
-    columns = {c["name"] for c in inspector.get_columns("participants")}
-    if "required_tags" in columns:
+    columns = {c["name"] for c in inspector.get_columns(table)}
+    if column in columns:
         return
-    default = "'[]'::json" if engine.dialect.name == "postgresql" else "'[]'"
     with engine.begin() as conn:
-        conn.execute(
-            text(
-                "ALTER TABLE participants ADD COLUMN required_tags JSON "
-                f"NOT NULL DEFAULT {default}"
-            )
-        )
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+
+
+def _migrate_participants_required_tags() -> None:
+    """为升级前已存在的 participants 表补 required_tags 列。
+
+    工位模块为参赛者新增了 required_tags（必需标签）列，这里对老库做
+    幂等的 ALTER TABLE 补列（新库列已存在，为空操作）。
+    """
+    default = "'[]'::json" if engine.dialect.name == "postgresql" else "'[]'"
+    _add_column_if_missing(
+        "participants",
+        "required_tags",
+        f"required_tags JSON NOT NULL DEFAULT {default}",
+    )
+
+
+def _migrate_tournament_lifecycle() -> None:
+    """为升级前已存在的库补赛事生命周期相关列（幂等）。
+
+    - tournaments.status：赛事状态（active/paused/archived），老赛事
+      一律视为 active；
+    - round_clocks.paused_by_maintenance：区分手动暂停与赛事维护态
+      冻结的时钟，老库无维护态暂停，一律为 False。
+    """
+    bool_default = "FALSE" if engine.dialect.name == "postgresql" else "0"
+    _add_column_if_missing(
+        "tournaments",
+        "status",
+        "status VARCHAR(16) NOT NULL DEFAULT 'active'",
+    )
+    _add_column_if_missing(
+        "round_clocks",
+        "paused_by_maintenance",
+        f"paused_by_maintenance BOOLEAN NOT NULL DEFAULT {bool_default}",
+    )

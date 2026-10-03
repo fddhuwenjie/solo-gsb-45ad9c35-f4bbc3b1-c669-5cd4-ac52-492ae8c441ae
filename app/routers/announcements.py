@@ -37,6 +37,7 @@ from ..services.announcements import (
     serialize_announcement,
     serialize_revision,
 )
+from ..services.lifecycle import ensure_tournament_writable
 from .tournaments import get_tournament_or_404
 
 router = APIRouter()
@@ -66,6 +67,7 @@ def create_announcement(
     # 写请求进程级串行：规则解析、序号快照确认、冻结收件人、事件
     # 序号与「提交→发布」全程持锁
     with writer_lock():
+        ensure_tournament_writable(db, tournament_id)
         response, event = publish_announcement(db, tournament_id, payload)
         # 幂等重放（event 为 None）没有任何写入，直接返回首次结果
         if event is not None:
@@ -109,6 +111,7 @@ def create_revision(
 ):
     announcement = _get_announcement_or_404(db, announcement_id)
     with writer_lock():
+        ensure_tournament_writable(db, announcement.tournament_id)
         response, event = revise_announcement(
             db, announcement.tournament_id, announcement, payload
         )
@@ -151,6 +154,7 @@ def create_acknowledgement(
     announcement = _get_announcement_or_404(db, announcement_id)
     revision = get_revision_or_404(announcement, version)
     with writer_lock():
+        ensure_tournament_writable(db, announcement.tournament_id)
         # 收件人判定以冻结快照为准；重复提交返回原回执（200，无写入）
         receipt, event = acknowledge(
             db, announcement.tournament_id, revision, payload.participant_id

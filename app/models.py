@@ -24,6 +24,12 @@ class Tournament(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 生命周期状态：active（正常）/ paused（维护态，写操作一律 409）/
+    # archived（归档，永久只读）。状态切换见 TournamentStateAction 与
+    # app/services/lifecycle.py
+    status: Mapped[str] = mapped_column(
+        String(16), default="active", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False
     )
@@ -340,6 +346,11 @@ class RoundClock(Base):
     )
     # 暂停时刻（仅 paused 状态有值）；恢复时清空并计入累计暂停
     paused_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 当前暂停是否由赛事维护态（tournament pause）触发：True 时由赛事
+    # resume 恢复；False（手动暂停）时赛事 resume 不动它
+    paused_by_maintenance: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
     # 轮次封盘时刻（仅 ended 状态有值）：冻结剩余时间
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # 各非轮空对局的累计加时：{"<match_id>": seconds}
@@ -381,6 +392,38 @@ class ClockAction(Base):
     )
 
     clock: Mapped[RoundClock] = relationship()
+
+
+class TournamentStateAction(Base):
+    """赛事状态切换（pause/resume/archive）请求的幂等记录。
+
+    request_id 在赛事内唯一；记录与赛事状态变更、被冻结/恢复的轮次
+    时钟、tournament.* 事件在同一事务中提交。被拒绝的切换（非法状态
+    迁移、归档前置条件不满足、序号快照冲突，409）不落任何记录。
+    """
+
+    __tablename__ = "tournament_state_actions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_id", "request_id", name="uq_tournament_state_action_request"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    # 客户端幂等键：赛事内唯一
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # pause / resume / archive
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 请求参数指纹：action + expected_event_seq
+    params: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # 首次执行后的响应快照：重复 request_id 原样返回
+    response: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
 
 
 class EventCounter(Base):

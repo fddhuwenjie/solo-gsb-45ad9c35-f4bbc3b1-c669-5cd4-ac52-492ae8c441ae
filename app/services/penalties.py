@@ -38,6 +38,7 @@ from ..schemas import (
     PenaltyRevokeRequest,
 )
 from .announcements import current_event_seq
+from .lifecycle import ensure_tournament_writable
 from .result_reviews import has_pending_review_for_tournament
 from .scoring import half_to_float
 
@@ -173,6 +174,8 @@ def record_penalty(
     事件序号快照冲突抛 409，且在任何写入之前抛出（不落库）。
     """
     points_half = round(req.points * 2)
+    # 维护态/归档赛事拒绝一切写操作（在幂等判定与任何写入之前）
+    ensure_tournament_writable(db, tournament_id)
     fingerprint = {
         "kind": DEDUCT,
         "participant_id": req.participant_id,
@@ -248,6 +251,8 @@ def revoke_penalty(
     if target is None:
         raise HTTPException(status_code=404, detail="扣分记录不存在")
     tournament_id = target.tournament_id
+    # 维护态/归档赛事拒绝一切写操作（在幂等判定与任何写入之前）
+    ensure_tournament_writable(db, tournament_id)
 
     fingerprint = {
         "kind": REVOKE,
